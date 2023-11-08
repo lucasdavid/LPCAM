@@ -58,10 +58,10 @@ def get_img_path(img_name, voc12_root):
     return os.path.join(voc12_root, IMG_FOLDER_NAME, img_name + '.jpg')
 
 def load_img_name_list(dataset_path):
-
-    img_name_list = np.loadtxt(dataset_path, dtype=np.int32)
-
-    return img_name_list
+    img_name_list = np.loadtxt(dataset_path, dtype="str").tolist()
+    if "_" in img_name_list[0]:
+        img_name_list = [int(name.replace("_", "")) for name in img_name_list]
+    return np.asarray(img_name_list).astype(np.int32)
 
 
 class TorchvisionNormalize():

@@ -21,11 +21,10 @@ def print_tensor(x,n=3):
             print(round(x[i,j],n),end=' ')
         print()
 
-def save_feature(save_dir,ckpt_path,voc12_root): ####### save feature from resnet50 at 'cluster/cam_feature/'
-    model = resnet50_cam.Net_CAM()
-    model.load_state_dict(torch.load(ckpt_path))
-    model.eval()
-    model.cuda()
+def save_feature(model, save_dir,voc12_root): ####### save feature from resnet50 at 'cluster/cam_feature/'
+    if osp.exists(osp.join(save_dir,'tensor_logits.pt')):
+        print("[lpcam:save-features] skipped")
+        return
 
     dataset = voc12.dataloader.VOC12ClassificationDataset('voc12/train.txt', voc12_root=voc12_root)
     data_loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=4, pin_memory=True, drop_last=False)
@@ -39,9 +38,9 @@ def save_feature(save_dir,ckpt_path,voc12_root): ####### save feature from resne
         for i, pack in enumerate(data_loader):
             img = pack['img'].cuda()
             label = pack['label']
-            x,cams,feature = model(img)
+            logit,feature = model(img, with_feature=True)
             name2id[pack['name'][0]] = i
-            tensor_logits[i] = x[0].cpu()
+            tensor_logits[i] = logit[0].cpu()
             # tensor_cam[i] = cams[0].cpu()
             tensor_feature[i] = feature[0].cpu()
             tensor_label[i] = label[0]
@@ -53,7 +52,10 @@ def save_feature(save_dir,ckpt_path,voc12_root): ####### save feature from resne
     torch.save(tensor_label, osp.join(save_dir,'tensor_label.pt'))
     np.save(osp.join(save_dir,'name2id.npy'), name2id)
 
-def load_feature_select_and_cluster(workspace, feature_dir, mask_dir, ckpt_path, load_cluster=False, num_cluster=12,select_thres=0.1,class_thres=0.9,context_thres=0.9,context_thres_low=0.05,tol=5): 
+def load_feature_select_and_cluster(model, workspace, feature_dir, mask_dir, load_cluster=False, num_cluster=12,select_thres=0.1,class_thres=0.9,context_thres=0.9,context_thres_low=0.05,tol=5, max_feature_samples=12_000, override=False):
+    if osp.exists(osp.join(workspace,'class_ceneters'+'.pt')) and not override:
+        return print("[lpcam:load-feature-select-and-cluster] skipped")
+
     tensor_feature = torch.load(osp.join(feature_dir,'tensor_feature.pt'))
     tensor_label = torch.load(osp.join(feature_dir,'tensor_label.pt'))
     name2id = np.load(osp.join(feature_dir,'name2id.npy'), allow_pickle=True).item()
@@ -62,9 +64,7 @@ def load_feature_select_and_cluster(workspace, feature_dir, mask_dir, ckpt_path,
         id2name[name2id[key]] = key
 
     ##### load model for calc similarity
-    model = resnet50_cam.Net_Feature()
-    model.load_state_dict(torch.load(ckpt_path))
-    w = model.classifier.weight.data.squeeze()
+    w = model.classifier.weight.squeeze().detach().cpu()
     
     ####### feature cluster #####
     centers = {}
@@ -87,8 +87,15 @@ def load_feature_select_and_cluster(workspace, feature_dir, mask_dir, ckpt_path,
             for idx in img_selected:
                 name = id2name[idx]
                 cam = np.load(osp.join(mask_dir, name+'.npy'), allow_pickle=True).item()
-                mask = cam['high_res']
-                valid_cat = cam['keys']
+                if "high_res" in cam:
+                    mask = cam['high_res']
+                    valid_cat = cam['keys']
+                else:
+                    # AffinityNet/Puzzle/OC-CSE format. In this case,
+                    # we revert the inclusion of a bg class.
+                    mask = cam["hr_cam"]
+                    valid_cat = cam['keys'][1:] - 1
+
                 feature_map = tensor_feature[idx].permute(1,2,0)
                 size = feature_map.shape[:2]
                 mask = F.interpolate(torch.tensor(mask).unsqueeze(0),size)[0]
@@ -101,10 +108,20 @@ def load_feature_select_and_cluster(workspace, feature_dir, mask_dir, ckpt_path,
                         feature_not_selected.append(feature_map[position_not_selected])
             feature_selected = torch.cat(feature_selected,0)
             feature_not_selected = torch.cat(feature_not_selected,0)
-            
 
-            cluster_ids_x, cluster_centers = kmeans(X=feature_selected, num_clusters=num_cluster, distance='cosine', device=torch.device('cuda:0'), tol=tol)
-            cluster_ids_x2, cluster_centers2 = kmeans(X=feature_not_selected, num_clusters=num_cluster, distance='cosine', device=torch.device('cuda:0'), tol=tol)
+            if feature_selected.shape[0] > max_feature_samples:
+                p = torch.randperm(feature_selected.shape[0])[:max_feature_samples]
+                feature_selected = feature_selected[p, ...]
+
+            if feature_not_selected.shape[0] > max_feature_samples:
+                p = torch.randperm(feature_not_selected.shape[0])[:max_feature_samples]
+                feature_not_selected = feature_not_selected[p, ...]
+
+            print(f"features selected    : {feature_selected.shape} {feature_selected.dtype}")
+            print(f"features not selected: {feature_not_selected.shape} {feature_not_selected.dtype}")
+            
+            cluster_ids_x, cluster_centers = kmeans(X=feature_selected, num_clusters=num_cluster, distance='cosine', device=torch.device('cuda:0'), tol=tol, max_iteration=501)
+            cluster_ids_x2, cluster_centers2 = kmeans(X=feature_not_selected, num_clusters=num_cluster, distance='cosine', device=torch.device('cuda:0'), tol=tol, max_iteration=501)
         
             torch.save(cluster_centers.cpu(), osp.join(cluster_result_dir,'cluster_centers_'+str(class_id)+'.pt'))
             torch.save(cluster_centers2.cpu(), osp.join(cluster_result_dir,'cluster_centers2_'+str(class_id)+'.pt'))
@@ -121,10 +138,10 @@ def load_feature_select_and_cluster(workspace, feature_dir, mask_dir, ckpt_path,
         cluster_center = cluster_centers[selected_cluster]
         centers[class_id] = cluster_center.cpu()
         
-        ##### print similarity matrix
-        # print_tensor(prob.numpy())
-        # for i in range(num_cluster):
-        #     print(selected_cluster[i].item(), round(prob[i,class_id].item(),3), torch.sum(cluster_ids_x==i).item())
+        print(f"-> FG similarity matrix ({class_id_to_name[class_id]})")
+        print_tensor("softmax(Centroid @ W.T) =", prob[:, class_id].numpy().round(2))
+        for i in range(num_cluster):
+           print(selected_cluster[i].item(), round(prob[i,class_id].item(), 3), torch.sum(cluster_ids_x == i).item())
         
         ###### calc similarity
         sim = torch.mm(cluster_centers2,w.T)
@@ -136,23 +153,20 @@ def load_feature_select_and_cluster(workspace, feature_dir, mask_dir, ckpt_path,
         context[class_id] = cluster_center2.cpu()
         
         ##### print similarity matrix
-        # print_tensor(prob.numpy())
-        # for i in range(num_cluster):
-        #     print(selected_cluster[i].item(), round(prob[i,class_id].item(),3), torch.sum(cluster_ids_x2==i).item())
+        print("-> BG similarity matrix (context)")
+        print_tensor("softmax(Centroid @ W.T) =", prob[:, class_id].numpy().round(2))
+        for i in range(num_cluster):
+            print(f"C#{i}", selected_cluster[i].item(), round(prob[i,class_id].item(),3), torch.sum(cluster_ids_x2==i).item())
 
     # torch.save(centers.cpu(), osp.join(workspace+'class_ceneters'+'.pt'))
     torch.save(centers, osp.join(workspace,'class_ceneters'+'.pt'))
     torch.save(context, osp.join(workspace,'class_context'+'.pt'))
 
-def make_lpcam(workspace,lpcam_out_dir,ckpt_path,voc12_root,list_name='voc12/train.txt'):
+def make_lpcam(model,workspace,lpcam_out_dir,voc12_root,list_name='voc12/train.txt'):
+    print("[lpcam:make-lpcam] start")
     cluster_centers = torch.load(osp.join(workspace,'class_ceneters'+'.pt'))
     cluster_context = torch.load(osp.join(workspace,'class_context'+'.pt'))
     
-    model = resnet50_cam.Net_Feature()
-    model.load_state_dict(torch.load(ckpt_path))
-    model.eval()
-    model.cuda()
-
     dataset = voc12.dataloader.VOC12ClassificationDatasetMSF(list_name, voc12_root=voc12_root,scales=(1.0, 0.5, 1.5, 2.0))
     data_loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=4, pin_memory=True, drop_last=False)
     start_time = time.time()
@@ -163,22 +177,27 @@ def make_lpcam(workspace,lpcam_out_dir,ckpt_path,voc12_root,list_name='voc12/tra
             img_name = pack['name'][0]
             size = pack['size']
             valid_cat = torch.nonzero(label)[:, 0].numpy()
-            
-            # if osp.exists(os.path.join(cam_out_dir, img_name+'.npy')):
-            #     continue
-            
+
+            save_path = os.path.join(lpcam_out_dir, img_name.replace('jpg','npy'))
+            if osp.exists(save_path):
+                continue
+
+            # print(">", img_name)
+
             strided_size = imutils.get_strided_size(size, 4)
             strided_up_size = imutils.get_strided_up_size(size, 16)
             
             features = []
             for img in imgs:
-                feature = model(img[0].cuda())
+                _, feature = model(img[0].cuda(), with_feature=True)
+                feature = feature.cpu()
                 features.append((feature[0]+feature[1].flip(-1)))
                 
             
             strided_cams = []
             highres_cams = []
             for class_id in valid_cat:
+                # print("class>", class_id)
                 strided_cam = []
                 highres_cam = []
                 for feature in features:
@@ -186,18 +205,18 @@ def make_lpcam(workspace,lpcam_out_dir,ckpt_path,voc12_root,list_name='voc12/tra
                     cluster_feature = cluster_centers[class_id]
                     att_maps = []
                     for j in range(cluster_feature.shape[0]): 
-                        cluster_feature_here = cluster_feature[j].repeat(h,w,1).cuda()
+                        cluster_feature_here = cluster_feature[j].repeat(h,w,1) # .cuda()
                         feature_here = feature.permute((1,2,0)).reshape(h,w,2048)
                         attention_map = F.cosine_similarity(feature_here,cluster_feature_here,2).unsqueeze(0).unsqueeze(0)
                         att_maps.append(attention_map.cpu())
-                    att_map = torch.mean(torch.cat(att_maps,0),0,keepdim=True).cuda()
+                    att_map = torch.mean(torch.cat(att_maps,0),0,keepdim=True) # .cuda()
                     
                     context_feature = cluster_context[class_id]
                     if context_feature.shape[0]>0:
                         context_attmaps = []
                         for j in range(context_feature.shape[0]):
                             context_feature_here = context_feature[j]
-                            context_feature_here = context_feature_here.repeat(h,w,1).cuda()
+                            context_feature_here = context_feature_here.repeat(h,w,1) # .cuda()
                             context_attmap = F.cosine_similarity(feature_here,context_feature_here,2).unsqueeze(0).unsqueeze(0)
                             context_attmaps.append(context_attmap.unsqueeze(0))
                         context_attmap = torch.mean(torch.cat(context_attmaps,0),0)
@@ -215,9 +234,25 @@ def make_lpcam(workspace,lpcam_out_dir,ckpt_path,voc12_root,list_name='voc12/tra
                 highres_cams.append(highres_cam.unsqueeze(0))
             strided_cams = torch.cat(strided_cams,0)
             highres_cams = torch.cat(highres_cams,0)
-            np.save(os.path.join(lpcam_out_dir, img_name.replace('jpg','npy')),{"keys": valid_cat,"cam": strided_cams,"high_res": highres_cams})
+            np.save(os.path.join(save_path),{"keys": valid_cat,"cam": strided_cams,"high_res": highres_cams})
 
 def run(args):
-    save_feature(save_dir=os.path.join(args.work_space,'cam_feature'),ckpt_path=args.cam_weights_name,voc12_root=args.voc12_root)
-    load_feature_select_and_cluster(workspace=args.work_space,feature_dir=os.path.join(args.work_space,'cam_feature'),mask_dir=args.cam_out_dir,ckpt_path=args.cam_weights_name)
-    make_lpcam(workspace=args.work_space,lpcam_out_dir=args.lpcam_out_dir,ckpt_path=args.cam_weights_name,voc12_root=args.voc12_root,list_name='voc12/train_aug.txt')
+    ckpt_path = args.cam_weights_name
+
+    if "rs269" in ckpt_path:
+        import net.networks
+
+        model = net.networks.Classifier(args.cam_network, 20)
+    else:  # Assume RN-50 (IRN's default)
+        model = resnet50_cam.Net_CAM()
+    model.load_state_dict(torch.load(ckpt_path))
+    model.eval()
+    model.cuda()
+
+    save_feature(model, save_dir=os.path.join(args.work_space,'cam_feature'),voc12_root=args.voc12_root)
+    load_feature_select_and_cluster(
+        model, workspace=args.work_space,feature_dir=os.path.join(args.work_space,'cam_feature'),mask_dir=args.cam_out_dir,
+        select_thres=args.kmeans_select_t, tol=args.kmeans_tol,
+        class_thres=0.8, context_thres=0.8,
+    )
+    make_lpcam(model, workspace=args.work_space,lpcam_out_dir=args.lpcam_out_dir,voc12_root=args.voc12_root,list_name='voc12/train.txt')

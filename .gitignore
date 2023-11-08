@@ -1,0 +1,23 @@
+experiments/
+__pycache__/
+
+analysis/
+examples/
+
+results/
+results_*/
+
+*.tgz
+
+CopyrightReceipt.pdf
+
+demo.py
+compare_*
+
+.ipynb_checkpoints/
+experiments
+
+notebooks/
+
+# CCAM/
+wandb/
